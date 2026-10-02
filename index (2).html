@@ -1,0 +1,638 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hoja de cálculo</title>
+<style>
+    body {
+        font-family: Arial, sans-serif;
+        margin: 20px;
+    }
+    table {
+        border-collapse: collapse;
+        table-layout: fixed;
+        user-select: none;
+    }
+    th, td {
+        border: 1px solid #ccc;
+        width: 80px;
+        height: 26px;
+        padding: 0 4px;
+        font-size: 13px;
+        font-weight: normal;
+        position: relative;
+        overflow: hidden;
+        white-space: nowrap;
+    }
+    th {
+        background: #eee;
+    }
+    th img {
+        width: 20px;
+        height: auto;
+        vertical-align: middle;
+    }
+    td.numero {
+        text-align: right;
+    }
+    td.negativo {
+        color: red;
+    }
+    td.error {
+        color: #b00;
+        background: #fee;
+        text-align: center;
+    }
+    td.activa {
+        outline: 2px solid #09f;
+        outline-offset: -2px;
+    }
+    td input {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        border: 0;
+        padding: 0 4px;
+        font: inherit;
+        outline: 2px solid #09f;
+    }
+    #aviso {
+        color: #b00;
+        margin: 8px 0;
+        min-height: 20px;
+    }
+</style>
+</head>
+<body>
+    <button id="btnCsv">Exportar CSV</button>
+    <button id="btnLimpiar">Limpiar hoja</button>
+    <div id="aviso"></div>
+    <table>
+        <thead></thead>
+        <tbody></tbody>
+    </table>
+
+
+<script>
+//CONFIGURACION
+const FILAS = 15;
+const COLUMNAS = 10;
+const CLAVE = 'mi-hoja';           // nombre con el que se guarda en localStorage
+
+//VARIABLES
+let datos = {};                    // lo que escribe el usuario: datos["A1"] = "=B1+2"
+let celdas = [];                   // los <td> de la tabla: celdas[fila][columna]
+let calculado = new Map();         // el resultado de cada celda
+let editando = null;               // la celda que se esta editando
+let activa = { x: 0, y: 0 };       // la celda seleccionada con el teclado
+
+//NOMBRES DE CELDA: (0,0) es "A1"
+function nombreColumna(x) {
+    return String.fromCharCode(65 + x);
+}
+
+function idCelda(x, y) {
+    return nombreColumna(x) + (y + 1);
+}
+
+function leerId(id) {
+    const x = id.charCodeAt(0) - 65;
+    const y = parseInt(id.slice(1)) - 1;
+    return { x: x, y: y };
+}
+
+function dentroDeLaHoja(x, y) {
+    return x >= 0 && x < COLUMNAS && y >= 0 && y < FILAS;
+}
+
+// un error se guarda como objeto { error: '#DIV/0!' }
+function esError(valor) {
+    return valor !== null && typeof valor === 'object';
+}
+
+function textoVisible(valor) {
+    if (valor === null) return '';
+    if (esError(valor)) return valor.error;
+    if (typeof valor === 'number') return String(Number(valor.toPrecision(12)));   // para que 0.1+0.2 sea 0.3
+    return valor;
+}
+
+//TOKENIZADOR
+function esDigito(c) {
+    return c >= '0' && c <= '9';
+}
+
+function esLetra(c) {
+    return /[a-zA-Z]/.test(c);
+}
+
+function tokenizar(texto) {
+    const tokens = [];
+    let pos = 0;
+
+    while (pos < texto.length) {
+        const c = texto[pos];
+
+        if (c === ' ') {
+            pos++;
+        } else if (esDigito(c)) {
+            let numero = '';
+            while (pos < texto.length && (esDigito(texto[pos]) || texto[pos] === '.')) {
+                numero += texto[pos];
+                pos++;
+            }
+            if (isNaN(Number(numero))) throw new Error('#ERROR!');
+            tokens.push(numero);
+        } else if (esLetra(c)) {
+            let nombre = '';
+            while (pos < texto.length && (esLetra(texto[pos]) || esDigito(texto[pos]))) {
+                nombre += texto[pos].toUpperCase();
+                pos++;
+            }
+            tokens.push(nombre);
+        } else if ('+-*/(),:;'.includes(c)) {
+            tokens.push(c);
+            pos++;
+        } else {
+            throw new Error('#ERROR!');
+        }
+    }
+    return tokens;
+}
+
+// EVALUADOR (sin eval)
+// Cada funcion resuelve un nivel de prioridad y llama a la de mayor prioridad:
+//   expr     = term (+ o - term)*
+//   term     = unario (* o / unario)*
+//   unario   = (- o +) unario | primario
+//   primario = numero | ( expr ) | funcion(...) | celda | rango
+// valorDe(id) me da el valor de otra celda.
+function evaluar(texto, valorDe) {
+    const tokens = tokenizar(texto);
+    let pos = 0;
+
+    if (tokens.length === 0) throw new Error('#ERROR!');
+
+    // valor de una celda; si esa celda tiene error, lanzo el mismo error
+    function valorCelda(id) {
+        const valor = valorDe(id);
+        if (esError(valor)) throw new Error(valor.error);
+        return valor;
+    }
+
+    // convierte un operando (numero o celda) en numero
+    function comoNumero(operando) {
+        if (typeof operando === 'number') return operando;
+        if (!operando.esRango) {
+            const valor = valorCelda(operando.ids[0]);
+            if (valor === null) throw new Error('#VACIO!');
+            if (typeof valor === 'number') return valor;
+        }
+        throw new Error('#VALUE!');
+    }
+
+    function expr() {
+        let resultado = term();
+        while (tokens[pos] === '+' || tokens[pos] === '-') {
+            const operador = tokens[pos];
+            pos++;
+            const derecho = term();
+            if (operador === '+') {
+                resultado = comoNumero(resultado) + comoNumero(derecho);
+            } else {
+                resultado = comoNumero(resultado) - comoNumero(derecho);
+            }
+        }
+        return resultado;
+    }
+
+    function term() {
+        let resultado = unario();
+        while (tokens[pos] === '*' || tokens[pos] === '/') {
+            const operador = tokens[pos];
+            pos++;
+            const derecho = comoNumero(unario());
+            const izquierdo = comoNumero(resultado);
+            if (operador === '*') {
+                resultado = izquierdo * derecho;
+            } else {
+                if (derecho === 0) throw new Error('#DIV/0!');
+                resultado = izquierdo / derecho;
+            }
+        }
+        return resultado;
+    }
+
+    function unario() {
+        if (tokens[pos] === '-') {
+            pos++;
+            return -comoNumero(unario());
+        }
+        if (tokens[pos] === '+') {
+            pos++;
+            return comoNumero(unario());
+        }
+        return primario();
+    }
+
+    function primario() {
+        const token = tokens[pos];
+        if (token === undefined) throw new Error('#ERROR!');
+
+        if (esDigito(token[0])) {                       // un numero
+            pos++;
+            return parseFloat(token);
+        }
+        if (token === '(') {                            // algo entre parentesis
+            pos++;
+            const valor = expr();
+            if (tokens[pos] !== ')') throw new Error('#ERROR!');
+            pos++;
+            return valor;
+        }
+        if (/^[A-Z]+\d+$/.test(token)) {                // una celda como A1
+            return leerCeldaORango();
+        }
+        if (/^[A-Z]+$/.test(token)) {                   // una funcion como SUMA
+            return leerFuncion();
+        }
+        throw new Error('#ERROR!');
+    }
+
+    // lee una celda como "B3" y devuelve sus coordenadas
+    function leerCoordenada() {
+        const token = tokens[pos];
+        if (token === undefined || !/^[A-Z]+\d+$/.test(token)) throw new Error('#ERROR!');
+        pos++;
+        const coordenada = leerId(token);
+        if (!dentroDeLaHoja(coordenada.x, coordenada.y)) throw new Error('#REF!');
+        return coordenada;
+    }
+
+    // una celda (A1) o un rango (A1:A10)
+    function leerCeldaORango() {
+        const inicio = leerCoordenada();
+        if (tokens[pos] !== ':') {
+            return { ids: [idCelda(inicio.x, inicio.y)], esRango: false };
+        }
+        pos++;
+        const fin = leerCoordenada();
+
+        const ids = [];
+        for (let y = Math.min(inicio.y, fin.y); y <= Math.max(inicio.y, fin.y); y++) {
+            for (let x = Math.min(inicio.x, fin.x); x <= Math.max(inicio.x, fin.x); x++) {
+                ids.push(idCelda(x, y));
+            }
+        }
+        return { ids: ids, esRango: true };
+    }
+
+    // NOMBRE ( argumentos )
+    function leerFuncion() {
+        const nombre = tokens[pos];
+        pos++;
+        if (tokens[pos] !== '(') throw new Error('#NAME?');
+        pos++;
+
+        const argumentos = [expr()];
+        while (tokens[pos] === ',' || tokens[pos] === ';') {
+            pos++;
+            argumentos.push(expr());
+        }
+        if (tokens[pos] !== ')') throw new Error('#ERROR!');
+        pos++;
+
+        return aplicarFuncion(nombre, argumentos);
+    }
+
+    // junto todos los numeros (el texto y las celdas vacias se ignoran)
+    function aplicarFuncion(nombre, argumentos) {
+        const numeros = [];
+        for (const argumento of argumentos) {
+            if (typeof argumento === 'number') {
+                numeros.push(argumento);
+            } else {
+                for (const id of argumento.ids) {
+                    const valor = valorCelda(id);
+                    if (typeof valor === 'number') numeros.push(valor);
+                }
+            }
+        }
+
+        let suma = 0;
+        for (const n of numeros) suma += n;
+
+        if (nombre === 'SUMA') return suma;
+        if (nombre === 'PROMEDIO') {
+            if (numeros.length === 0) throw new Error('#DIV/0!');
+            return suma / numeros.length;
+        }
+        if (nombre === 'MAX') return numeros.length > 0 ? Math.max(...numeros) : 0;
+        if (nombre === 'MIN') return numeros.length > 0 ? Math.min(...numeros) : 0;
+        throw new Error('#NAME?');
+    }
+
+    //Aqui empieza a evaluar
+    const resultado = expr();
+    if (pos < tokens.length) throw new Error('#ERROR!');    // sobraron piezas, por ejemplo "1+2)"
+
+    if (typeof resultado === 'number') {
+        if (!isFinite(resultado)) throw new Error('#ERROR!');
+        return resultado;
+    }
+    if (resultado.esRango) throw new Error('#VALUE!');
+    const valor = valorCelda(resultado.ids[0]);             // "=A1" copia el valor de A1
+    if (valor === null) throw new Error('#VACIO!');
+    return valor;
+}
+
+//RECALCULO Y REFERENCIAS CIRCULARES
+// Una celda se calcula cuando alguien la necesita, y primero se calculan las celdas que usa.
+// "memo" guarda las que ya calcule. "enProceso" guarda las que estoy calculando ahora:
+// si vuelvo a entrar a una de ellas, hay un ciclo (A1 usa B1 y B1 usa A1)
+// y devuelvo #CIRCULAR! en vez de seguir calculando.
+function calcularTexto(texto, valorDe) {
+    if (texto.trim() === '') return null;                   // celda vacia
+
+    if (texto.startsWith('=')) {                            // es formula
+        try {
+            return evaluar(texto.slice(1), valorDe);
+        } catch (e) {
+            const codigo = e.message.startsWith('#') ? e.message : '#ERROR!';
+            return { error: codigo };
+        }
+    }
+
+    const numero = Number(texto);                           // numero o texto normal
+    return isNaN(numero) ? texto : numero;
+}
+
+function recalcular() {
+    const memo = new Map();
+    const enProceso = new Set();
+
+    function valorDe(id) {
+        if (memo.has(id)) return memo.get(id);
+        if (enProceso.has(id)) return { error: '#CIRCULAR!' };
+
+        enProceso.add(id);
+        const resultado = calcularTexto(datos[id] || '', valorDe);
+        enProceso.delete(id);
+
+        memo.set(id, resultado);
+        return resultado;
+    }
+
+    for (let y = 0; y < FILAS; y++) {
+        for (let x = 0; x < COLUMNAS; x++) {
+            valorDe(idCelda(x, y));
+        }
+    }
+    return memo;
+}
+
+//TABLA Y PANTALLA
+const aviso = document.getElementById('aviso');
+
+//Tabla con ciclos anidados
+function construirTabla() {
+    const thead = document.querySelector('thead');
+    const tbody = document.querySelector('tbody');
+
+    const filaEncabezado = document.createElement('tr');
+
+    // la esquina de arriba a la izquierda lleva el logo de Excel
+    const esquina = document.createElement('th');
+    const logo = document.createElement('img');
+    logo.src = 'https://thumb.wikimedia.org/wikipedia/commons/thumb/7/73/Microsoft_Excel_2013-2019_logo.svg/960px-Microsoft_Excel_2013-2019_logo.svg.png?utm_source=es.wikipedia.org&utm_campaign=index&utm_content=thumbnail';       // el archivo debe estar en la misma carpeta que este HTML
+    logo.alt = 'Excel';                // texto que se ve si la imagen no carga jeje
+    filaEncabezado.appendChild(esquina);
+
+    for (let x = 0; x < COLUMNAS; x++) {
+        const th = document.createElement('th');
+        th.textContent = nombreColumna(x);
+        filaEncabezado.appendChild(th);
+    }
+    thead.appendChild(filaEncabezado);
+
+    for (let y = 0; y < FILAS; y++) {
+        const tr = document.createElement('tr');
+
+        const numeroFila = document.createElement('th');
+        numeroFila.textContent = y + 1;
+        tr.appendChild(numeroFila);
+
+        const filaCeldas = [];
+        for (let x = 0; x < COLUMNAS; x++) {
+            const td = document.createElement('td');
+            td.dataset.x = x;
+            td.dataset.y = y;
+            tr.appendChild(td);
+            filaCeldas.push(td);
+        }
+        celdas.push(filaCeldas);
+        tbody.appendChild(tr);
+    }
+}
+
+// dibuja los resultados en la tabla
+function mostrar() {
+    calculado = recalcular();
+    const circulares = [];
+
+    for (let y = 0; y < FILAS; y++) {
+        for (let x = 0; x < COLUMNAS; x++) {
+            if (editando && editando.x === x && editando.y === y) continue;
+
+            const id = idCelda(x, y);
+            const valor = calculado.get(id);
+            const td = celdas[y][x];
+            const esNumero = typeof valor === 'number';
+
+            td.textContent = textoVisible(valor);           // textContent para que no se meta HTML
+            td.classList.toggle('error', esError(valor));
+            td.classList.toggle('numero', esNumero);
+            td.classList.toggle('negativo', esNumero && valor < 0);   //negativos en rojo
+
+            if (esError(valor) && valor.error === '#CIRCULAR!') circulares.push(id);
+        }
+    }
+
+    if (circulares.length > 0) {
+        aviso.textContent = 'Referencia circular en: ' + circulares.join(', ');
+    } else {
+        aviso.textContent = '';
+    }
+    marcarActiva();
+}
+
+//NAVEGACION CON TECLADO
+function marcarActiva() {
+    for (let y = 0; y < FILAS; y++) {
+        for (let x = 0; x < COLUMNAS; x++) {
+            celdas[y][x].classList.toggle('activa', x === activa.x && y === activa.y);
+        }
+    }
+}
+
+function mover(dx, dy) {
+    activa.x = Math.max(0, Math.min(COLUMNAS - 1, activa.x + dx));   // sin salirse de la hoja
+    activa.y = Math.max(0, Math.min(FILAS - 1, activa.y + dy));
+    marcarActiva();
+}
+
+//EDITAR CELDAS
+function editar(x, y, textoInicial) {
+    if (editando) return;
+
+    const td = celdas[y][x];
+    const input = document.createElement('input');
+    if (textoInicial !== undefined) {
+        input.value = textoInicial;
+    } else {
+        input.value = datos[idCelda(x, y)] || '';
+    }
+    td.textContent = '';
+    td.appendChild(input);
+    input.focus();
+    editando = { x: x, y: y, input: input };
+
+    input.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            terminar(true);
+            mover(0, 1);
+        } else if (e.key === 'Tab') {
+            e.preventDefault();
+            terminar(true);
+            mover(1, 0);
+        } else if (e.key === 'Escape') {
+            terminar(false);
+        }
+        e.stopPropagation();
+    });
+    input.addEventListener('blur', function () {
+        terminar(true);
+    });
+}
+
+function terminar(guardar) {
+    if (!editando) return;
+    const x = editando.x;
+    const y = editando.y;
+    const texto = editando.input.value;
+    editando = null;       // lo pongo en null primero porque al quitar el input se vuelve a disparar el blur
+
+    if (guardar) {
+        if (texto === '') {
+            delete datos[idCelda(x, y)];
+        } else {
+            datos[idCelda(x, y)] = texto;
+        }
+        guardarDatos();
+    }
+    mostrar();
+}
+
+//GUARDAR Y EXPORTAR
+function guardarDatos() {
+    try {
+        localStorage.setItem(CLAVE, JSON.stringify(datos));
+    } catch (e) {
+        // si el navegador no deja guardar, la hoja sigue funcionando
+    }
+}
+
+function cargarDatos() {
+    try {
+        const guardado = JSON.parse(localStorage.getItem(CLAVE)) || {};
+        for (const id in guardado) {
+            if (/^[A-Z]\d+$/.test(id) && typeof guardado[id] === 'string') {
+                datos[id] = guardado[id];
+            }
+        }
+    } catch (e) {
+        // si los datos guardados estan dañados, empiezo con la hoja vacia
+    }
+}
+
+function exportarCsv() {
+    const lineas = [];
+    for (let y = 0; y < FILAS; y++) {
+        const campos = [];
+        for (let x = 0; x < COLUMNAS; x++) {
+            let texto = textoVisible(calculado.get(idCelda(x, y)));
+            if (/[",\n]/.test(texto)) {
+                texto = '"' + texto.replace(/"/g, '""') + '"';
+            }
+            campos.push(texto);
+        }
+        lineas.push(campos.join(','));
+    }
+
+    // el \ufeff al inicio es para que Excel lea bien las tildes
+    const blob = new Blob(['\ufeff' + lineas.join('\r\n')], { type: 'text/csv;charset=utf-8' });
+    const enlace = document.createElement('a');
+    enlace.href = URL.createObjectURL(blob);
+    enlace.download = 'hoja.csv';
+    enlace.click();
+    URL.revokeObjectURL(enlace.href);
+}
+
+//EVENTOS
+document.querySelector('tbody').addEventListener('click', function (e) {
+    const td = e.target.closest('td');
+    if (!td || e.target.tagName === 'INPUT') return;
+    terminar(true);
+    activa = { x: Number(td.dataset.x), y: Number(td.dataset.y) };
+    marcarActiva();
+});
+
+document.querySelector('tbody').addEventListener('dblclick', function (e) {
+    const td = e.target.closest('td');
+    if (td) editar(Number(td.dataset.x), Number(td.dataset.y));
+});
+
+document.addEventListener('keydown', function (e) {
+    if (editando || e.ctrlKey || e.metaKey || e.altKey) return;
+
+    switch (e.key) {
+        case 'ArrowUp':    e.preventDefault(); mover(0, -1); break;
+        case 'ArrowDown':  e.preventDefault(); mover(0, 1); break;
+        case 'ArrowLeft':  e.preventDefault(); mover(-1, 0); break;
+        case 'ArrowRight': e.preventDefault(); mover(1, 0); break;
+        case 'Tab':        e.preventDefault(); mover(e.shiftKey ? -1 : 1, 0); break;
+        case 'Enter':      e.preventDefault(); editar(activa.x, activa.y); break;
+        case 'Delete':
+        case 'Backspace':
+            e.preventDefault();
+            delete datos[idCelda(activa.x, activa.y)];
+            guardarDatos();
+            mostrar();
+            break;
+        default:
+            if (e.key.length === 1) {       // si escribo una letra o numero, empieza a editar
+                e.preventDefault();
+                editar(activa.x, activa.y, e.key);
+            }
+    }
+});
+
+document.getElementById('btnCsv').addEventListener('click', exportarCsv);
+
+document.getElementById('btnLimpiar').addEventListener('click', function () {
+    if (!confirm('¿Borrar toda la hoja?')) return;
+    datos = {};
+    guardarDatos();
+    mostrar();
+});
+
+//INICIO
+construirTabla();
+cargarDatos();
+mostrar();
+</script>
+</body>
+</html>
